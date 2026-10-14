@@ -6,7 +6,7 @@
 "main": "whatsapp.js",
 "scripts": {
 "start": "node whatsapp.js",
-"postinstall": "puppeteer browsers install chrome"
+"postinstall": "npx puppeteer browsers install chrome@146.0.7680.31"
 },
 "engines": {
 "node": "20.x"
