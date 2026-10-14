@@ -1,76 +1,41 @@
 'use strict';
 
 const http = require('node:http');
-const { Pool } = require('pg');
+const path = require('node:path');
+const fs = require('node:fs');
 
 const {
     default: makeWASocket,
-    DisconnectReason,
-    initAuthCreds,
-    BufferJSON,
-    proto
+    useMultiFileAuthState,
+    DisconnectReason
 } = require('@whiskeysockets/baileys');
 
 const PHONE_NUMBER = (
     process.env.WHATSAPP_PHONE_NUMBER || ''
 ).replace(/\D/g, '');
 
-const DATABASE_URL = process.env.DATABASE_URL || '';
-
-const SESSION_ID =
-    process.env.WHATSAPP_SESSION_ID ||
-    'global-bullion-syndicate-main';
+const AUTH_DIR = path.resolve(
+    process.env.BAILEYS_AUTH_DIR || './baileys_auth'
+);
 
 const PORT = Number(process.env.PORT || 10000);
 
 const INITIAL_RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 
-const TABLE_NAME = 'gbs_baileys_auth';
-
-if (!/^\d{8,15}$/.test(PHONE_NUMBER)) {
-    throw new Error(
-        'WHATSAPP_PHONE_NUMBER is missing or invalid. ' +
-        'Use the full international number with digits only.'
-    );
-}
-
-if (!DATABASE_URL) {
-    throw new Error(
-        'DATABASE_URL is missing. Add a PostgreSQL connection ' +
-        'string in Render Environment Variables to preserve ' +
-        'WhatsApp authentication.'
-    );
-}
-
-if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
-    throw new Error('PORT is invalid.');
-}
-
-const pool = new Pool({
-    connectionString: DATABASE_URL,
-    max: 5,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 20000,
-    keepAlive: true
-});
-
-pool.on('error', (error) => {
-    console.error(
-        '[DATABASE POOL ERROR]',
-        error.message || error
-    );
-});
-
 let activeSocket = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let connecting = false;
 let shuttingDown = false;
-let databaseReady = false;
 let whatsappStatus = 'starting';
 let lastConnectedAt = null;
 let server = null;
+let pairingCodeRequested = false;
+
+function log(message) {
+    console.log(`[GBS] ${message}`);
+}
 
 function sendJson(res, statusCode, data) {
     const body = JSON.stringify(data);
@@ -105,28 +70,25 @@ function startHttpServer() {
                 ).pathname;
             } catch {
                 return sendJson(res, 400, {
-                    error: 'Invalid request URL'
+                    error: 'Invalid request'
                 });
             }
 
-            if (
-                pathname === '/' ||
-                pathname === '/health' ||
-                pathname === '/status'
-            ) {
+            if (pathname === '/' || pathname === '/health') {
                 return sendJson(res, 200, {
                     service: 'Global Bullion Syndicate',
-                    status: shuttingDown
-                        ? 'shutting_down'
-                        : 'running',
-                    database: databaseReady
-                        ? 'connected'
-                        : 'not_ready',
+                    status: shuttingDown ? 'stopping' : 'running',
+                    uptime_seconds: Math.floor(process.uptime())
+                });
+            }
+
+            if (pathname === '/status') {
+                return sendJson(res, 200, {
+                    service: 'Global Bullion Syndicate',
+                    status: shuttingDown ? 'stopping' : 'running',
                     whatsapp: whatsappStatus,
                     last_connected_at: lastConnectedAt,
-                    uptime_seconds: Math.floor(
-                        process.uptime()
-                    )
+                    uptime_seconds: Math.floor(process.uptime())
                 });
             }
 
@@ -140,202 +102,11 @@ function startHttpServer() {
         server.listen(PORT, '0.0.0.0', () => {
             server.removeListener('error', reject);
 
-            console.log(
-                `[HTTP] Listening on 0.0.0.0:${PORT}`
-            );
+            log(`HTTP server listening on port ${PORT}`);
 
             resolve();
         });
     });
-}
-
-function serialize(value) {
-    return JSON.stringify(value, BufferJSON.replacer);
-}
-
-function deserialize(value) {
-    if (
-        value === null ||
-        typeof value === 'undefined'
-    ) {
-        return null;
-    }
-
-    const json = typeof value === 'string'
-        ? value
-        : JSON.stringify(value);
-
-    return JSON.parse(json, BufferJSON.reviver);
-}
-
-async function saveAuthItem(type, id, value) {
-    if (
-        value === null ||
-        typeof value === 'undefined'
-    ) {
-        await pool.query(
-            `DELETE FROM ${TABLE_NAME}
-             WHERE session_id = $1
-             AND item_type = $2
-             AND item_id = $3`,
-            [SESSION_ID, type, id]
-        );
-
-        return;
-    }
-
-    await pool.query(
-        `INSERT INTO ${TABLE_NAME}
-            (
-                session_id,
-                item_type,
-                item_id,
-                item_value,
-                updated_at
-            )
-         VALUES ($1, $2, $3, $4::jsonb, NOW())
-         ON CONFLICT (session_id, item_type, item_id)
-         DO UPDATE SET
-            item_value = EXCLUDED.item_value,
-            updated_at = NOW()`,
-        [
-            SESSION_ID,
-            type,
-            id,
-            serialize(value)
-        ]
-    );
-}
-
-async function loadAuthItem(type, id) {
-    const result = await pool.query(
-        `SELECT item_value
-         FROM ${TABLE_NAME}
-         WHERE session_id = $1
-         AND item_type = $2
-         AND item_id = $3
-         LIMIT 1`,
-        [SESSION_ID, type, id]
-    );
-
-    if (!result.rowCount) {
-        return null;
-    }
-
-    return deserialize(result.rows[0].item_value);
-}
-
-async function createDatabaseAuthState() {
-    const savedCreds = await loadAuthItem(
-        'creds',
-        'creds'
-    );
-
-    const creds = savedCreds || initAuthCreds();
-
-    if (!savedCreds) {
-        await saveAuthItem(
-            'creds',
-            'creds',
-            creds
-        );
-
-        console.log(
-            '[AUTH] New authentication state created in PostgreSQL.'
-        );
-    } else {
-        console.log(
-            '[AUTH] Existing authentication state restored from PostgreSQL.'
-        );
-    }
-
-    return {
-        state: {
-            creds,
-
-            keys: {
-                get: async (type, ids) => {
-                    if (!ids.length) {
-                        return {};
-                    }
-
-                    const result = await pool.query(
-                        `SELECT item_id, item_value
-                         FROM ${TABLE_NAME}
-                         WHERE session_id = $1
-                         AND item_type = $2
-                         AND item_id = ANY($3::text[])`,
-                        [
-                            SESSION_ID,
-                            type,
-                            ids
-                        ]
-                    );
-
-                    const data = {};
-
-                    for (const row of result.rows) {
-                        let value = deserialize(
-                            row.item_value
-                        );
-
-                        if (
-                            type === 'app-state-sync-key' &&
-                            value
-                        ) {
-                            value =
-                                proto.Message.AppStateSyncKeyData
-                                    .fromObject(value);
-                        }
-
-                        data[row.item_id] = value;
-                    }
-
-                    return data;
-                },
-
-                set: async (data) => {
-                    const tasks = [];
-
-                    for (
-                        const [type, entries]
-                        of Object.entries(data)
-                    ) {
-                        for (
-                            const [id, value]
-                            of Object.entries(entries || {})
-                        ) {
-                            tasks.push(
-                                saveAuthItem(
-                                    type,
-                                    id,
-                                    value
-                                )
-                            );
-                        }
-                    }
-
-                    await Promise.all(tasks);
-                },
-
-                clear: async () => {
-                    await pool.query(
-                        `DELETE FROM ${TABLE_NAME}
-                         WHERE session_id = $1`,
-                        [SESSION_ID]
-                    );
-                }
-            }
-        },
-
-        saveCreds: async () => {
-            await saveAuthItem(
-                'creds',
-                'creds',
-                creds
-            );
-        }
-    };
 }
 
 function getDisconnectStatusCode(error) {
@@ -365,20 +136,15 @@ function scheduleReconnect(reason) {
 
     whatsappStatus = 'reconnecting';
 
-    console.warn(
-        `[RECONNECT] ${
-            reason || 'Connection closed'
-        }. Retry in ${
-            Math.ceil(delay / 1000)
-        }s (attempt ${reconnectAttempts}).`
+    log(
+        `${reason || 'Connection closed'}. ` +
+        `Retrying in ${Math.ceil(delay / 1000)} seconds.`
     );
 
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         void connectToWhatsApp();
     }, delay);
-
-    reconnectTimer.unref?.();
 }
 
 async function connectToWhatsApp() {
@@ -390,34 +156,56 @@ async function connectToWhatsApp() {
         return;
     }
 
+    if (!/^\d{8,15}$/.test(PHONE_NUMBER)) {
+        whatsappStatus = 'configuration_error';
+
+        log(
+            'WHATSAPP_PHONE_NUMBER is missing or invalid. ' +
+            'Set it in Render Environment Variables.'
+        );
+
+        return;
+    }
+
     connecting = true;
     whatsappStatus = 'connecting';
 
-    let socketCreated = null;
+    let sock = null;
 
     try {
-        const auth = await createDatabaseAuthState();
+        fs.mkdirSync(AUTH_DIR, {
+            recursive: true
+        });
 
-        let pairingCodeRequested = false;
+        fs.accessSync(
+            AUTH_DIR,
+            fs.constants.R_OK | fs.constants.W_OK
+        );
 
-        const sock = makeWASocket({
-            auth: auth.state,
+        const {
+            state,
+            saveCreds
+        } = await useMultiFileAuthState(AUTH_DIR);
+
+        sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false,
             markOnlineOnConnect: false,
             syncFullHistory: false,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000
         });
 
-        socketCreated = sock;
         activeSocket = sock;
 
-        sock.ev.on('creds.update', () => {
-            auth.saveCreds().catch((error) => {
-                console.error(
-                    '[AUTH SAVE ERROR]',
-                    error.message || error
+        sock.ev.on('creds.update', async () => {
+            try {
+                await saveCreds();
+            } catch (error) {
+                log(
+                    `Authentication save failed: ${error.message}`
                 );
-            });
+            }
         });
 
         sock.ev.on(
@@ -425,74 +213,62 @@ async function connectToWhatsApp() {
             async (update) => {
                 const {
                     connection,
-                    lastDisconnect,
-                    qr
+                    lastDisconnect
                 } = update;
 
                 if (
-                    qr &&
-                    !auth.state.creds.registered &&
-                    !pairingCodeRequested
+                    !state.creds.registered &&
+                    !pairingCodeRequested &&
+                    connection === 'connecting'
                 ) {
                     pairingCodeRequested = true;
 
-                    try {
-                        const code =
-                            await sock.requestPairingCode(
-                                PHONE_NUMBER
+                    setTimeout(async () => {
+                        if (
+                            shuttingDown ||
+                            sock !== activeSocket ||
+                            state.creds.registered
+                        ) {
+                            return;
+                        }
+
+                        try {
+                            const code =
+                                await sock.requestPairingCode(
+                                    PHONE_NUMBER
+                                );
+
+                            log('WhatsApp pairing is required.');
+                            log(`Pairing code: ${code}`);
+                            log(
+                                'Enter the code in WhatsApp > Linked Devices > ' +
+                                'Link a Device > Link with phone number instead.'
                             );
+                            log('Keep the pairing code private.');
+                        } catch (error) {
+                            pairingCodeRequested = false;
 
-                        console.log(
-                            '========================================'
-                        );
-
-                        console.log(
-                            'GLOBAL BULLION SYNDICATE — PAIRING CODE'
-                        );
-
-                        console.log(
-                            `Pairing code: ${code}`
-                        );
-
-                        console.log(
-                            'Enter it in WhatsApp > Linked Devices > ' +
-                            'Link a Device > Link with phone number instead.'
-                        );
-
-                        console.log(
-                            'Keep this code private.'
-                        );
-
-                        console.log(
-                            '========================================'
-                        );
-                    } catch (error) {
-                        console.error(
-                            '[PAIRING CODE ERROR]',
-                            error.message || error
-                        );
-                    }
+                            log(
+                                `Pairing code request failed: ${error.message}`
+                            );
+                        }
+                    }, 3000);
                 }
 
                 if (connection === 'connecting') {
                     whatsappStatus = 'connecting';
-
-                    console.log(
-                        '[WHATSAPP] Connecting.'
-                    );
+                    log('Connecting to WhatsApp.');
                 }
 
                 if (connection === 'open') {
                     reconnectAttempts = 0;
+                    pairingCodeRequested = false;
                     whatsappStatus = 'connected';
 
-                    lastConnectedAt =
-                        new Date().toISOString();
+                    lastConnectedAt = new Date().toISOString();
 
-                    console.log(
-                        '[WHATSAPP] Connected. ' +
-                        'Authentication state is stored in PostgreSQL.'
-                    );
+                    log('WhatsApp connected successfully.');
+                    log('Authentication files are being saved locally.');
                 }
 
                 if (connection === 'close') {
@@ -503,39 +279,30 @@ async function connectToWhatsApp() {
                     activeSocket = null;
 
                     const error = lastDisconnect?.error;
-
                     const statusCode =
                         getDisconnectStatusCode(error);
 
-                    console.warn(
-                        '[WHATSAPP] Disconnected:',
-                        error?.message || 'Connection closed'
+                    log(
+                        `WhatsApp disconnected: ${
+                            error?.message || 'Connection closed'
+                        }`
                     );
 
-                    if (statusCode !== null) {
-                        console.warn(
-                            '[WHATSAPP] Disconnect status:',
-                            statusCode
-                        );
-                    }
-
                     if (
-                        statusCode ===
-                        DisconnectReason.loggedOut
+                        statusCode === DisconnectReason.loggedOut
                     ) {
                         whatsappStatus = 'logged_out';
 
-                        console.error(
-                            '[AUTH] WhatsApp logged out this linked device. ' +
-                            'Review the session before deliberately pairing again.'
+                        log(
+                            'WhatsApp logged out this linked device. ' +
+                            'Review the saved session before pairing again.'
                         );
 
                         return;
                     }
 
                     scheduleReconnect(
-                        error?.message ||
-                        'WhatsApp connection closed'
+                        error?.message || 'Connection closed'
                     );
                 }
             }
@@ -590,40 +357,29 @@ async function connectToWhatsApp() {
                             }
                         );
 
-                        console.log(
-                            '[MESSAGE] Replied to a private ping test.'
-                        );
+                        log('Private ping test answered.');
                     } catch (error) {
-                        console.error(
-                            '[MESSAGE ERROR]',
-                            error.message || error
+                        log(
+                            `Message send failed: ${error.message}`
                         );
                     }
                 }
             }
         );
     } catch (error) {
-        if (
-            socketCreated &&
-            socketCreated === activeSocket
-        ) {
+        if (sock && sock === activeSocket) {
             activeSocket = null;
 
             try {
-                socketCreated.end(error);
+                sock.end(error);
             } catch {}
         }
 
         whatsappStatus = 'error';
 
-        console.error(
-            '[WHATSAPP START ERROR]',
-            error.stack || error.message || error
-        );
+        log(`WhatsApp startup failed: ${error.message}`);
 
-        scheduleReconnect(
-            error?.message || 'WhatsApp startup failed'
-        );
+        scheduleReconnect('WhatsApp startup failed');
     } finally {
         connecting = false;
     }
@@ -635,9 +391,9 @@ async function shutdown(signal) {
     }
 
     shuttingDown = true;
-    whatsappStatus = 'shutting_down';
+    whatsappStatus = 'stopping';
 
-    console.log(`[SHUTDOWN] ${signal}`);
+    log(`Shutdown requested: ${signal}`);
 
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
@@ -650,10 +406,7 @@ async function shutdown(signal) {
                 new Error(`Process shutdown: ${signal}`)
             );
         } catch (error) {
-            console.error(
-                '[SHUTDOWN SOCKET ERROR]',
-                error.message || error
-            );
+            log(`Socket shutdown issue: ${error.message}`);
         }
 
         activeSocket = null;
@@ -663,15 +416,6 @@ async function shutdown(signal) {
         await new Promise((resolve) => {
             server.close(resolve);
         });
-    }
-
-    try {
-        await pool.end();
-    } catch (error) {
-        console.error(
-            '[DATABASE SHUTDOWN ERROR]',
-            error.message || error
-        );
     }
 
     process.exit(0);
@@ -686,55 +430,16 @@ process.once('SIGTERM', () => {
 });
 
 async function main() {
-    await pool.query('SELECT 1');
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
-            session_id TEXT NOT NULL,
-            item_type TEXT NOT NULL,
-            item_id TEXT NOT NULL,
-            item_value JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (
-                session_id,
-                item_type,
-                item_id
-            )
-        )
-    `);
-
-    databaseReady = true;
-
-    console.log(
-        '[DATABASE] PostgreSQL is ready.'
-    );
-
     await startHttpServer();
 
-    console.log(
-        '[APP] Global Bullion Syndicate is ready.'
-    );
+    log('Global Bullion Syndicate started.');
+    log('Health endpoint: /health');
+    log('Status endpoint: /status');
 
-    console.log(
-        '[APP] Health endpoint: /health'
-    );
-
-    console.log(
-        '[APP] Status endpoint: /status'
-    );
-
-    void connectToWhatsApp();
+    await connectToWhatsApp();
 }
 
-main().catch(async (error) => {
-    console.error(
-        '[FATAL STARTUP ERROR]',
-        error.stack || error.message || error
-    );
-
-    try {
-        await pool.end();
-    } catch {}
-
-    process.exit(1);
+main().catch((error) => {
+    log(`Application startup failed: ${error.message}`);
+    process.exitCode = 1;
 });
