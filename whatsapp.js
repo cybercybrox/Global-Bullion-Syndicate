@@ -1,32 +1,41 @@
 'use strict';
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const path = require('path');
+const fs = require('fs');
 
 // ============================================
 // GLOBAL BULLION SYNDICATE — CONFIGURATION
 // ============================================
 
-// International phone number: digits only, including country code.
-const PHONE_NUMBER = '263789379749';
+// Set this in Render's Environment Variables.
+// Use the international number with digits only.
+const PHONE_NUMBER = (
+    process.env.WHATSAPP_PHONE_NUMBER || ''
+).replace(/\D/g, '');
 
-// Keep the session ID stable between restarts.
 const SESSION_ID = 'global-bullion-syndicate';
 
-// Authentication data directory.
-const SESSION_PATH = './.wwebjs_auth';
+const SESSION_PATH = path.resolve(
+    process.env.WWEBJS_AUTH_PATH || '.wwebjs_auth'
+);
 
-// Pairing code refresh interval: 3 minutes.
 const PAIRING_INTERVAL_MS = 180000;
 
 // ============================================
 // VALIDATE CONFIGURATION
 // ============================================
 
-const normalizedNumber = PHONE_NUMBER.replace(/\D/g, '');
-
-if (!/^\d{8,15}$/.test(normalizedNumber)) {
+if (!PHONE_NUMBER) {
     throw new Error(
-        'Invalid PHONE_NUMBER. Use international format with country code.'
+        'Missing WHATSAPP_PHONE_NUMBER. ' +
+        'Add your international phone number in Render Environment Variables.'
+    );
+}
+
+if (!/^\d{8,15}$/.test(PHONE_NUMBER)) {
+    throw new Error(
+        'Invalid WhatsApp number. Use international format with digits only.'
     );
 }
 
@@ -41,7 +50,7 @@ const client = new Client({
     }),
 
     pairWithPhoneNumber: {
-        phoneNumber: normalizedNumber,
+        phoneNumber: PHONE_NUMBER,
         showNotification: true,
         intervalMs: PAIRING_INTERVAL_MS
     },
@@ -56,7 +65,7 @@ const client = new Client({
 });
 
 // ============================================
-// PAIRING CODE EVENT
+// PHONE-NUMBER PAIRING
 // ============================================
 
 client.on('code', (code) => {
@@ -64,11 +73,13 @@ client.on('code', (code) => {
     console.log(' GLOBAL BULLION SYNDICATE');
     console.log(' WHATSAPP PAIRING CODE');
     console.log('========================================');
-    console.log(`\nPairing code: ${code}\n`);
-    console.log('On your phone:');
-    console.log('WhatsApp → Linked Devices');
-    console.log('→ Link a Device');
-    console.log('→ Link with phone number instead');
+    console.log(`Pairing code: ${code}`);
+    console.log('\nOn your phone:');
+    console.log('1. Open WhatsApp.');
+    console.log('2. Open Linked Devices.');
+    console.log('3. Tap Link a Device.');
+    console.log('4. Choose Link with phone number instead.');
+    console.log('5. Enter the pairing code shown above.');
     console.log('========================================\n');
 });
 
@@ -86,6 +97,7 @@ client.on('ready', () => {
     console.log(' WHATSAPP CONNECTED');
     console.log('========================================');
     console.log('Session ID:', SESSION_ID);
+    console.log('Session directory:', SESSION_PATH);
     console.log('WhatsApp client is ready.');
     console.log('========================================\n');
 });
@@ -96,6 +108,9 @@ client.on('auth_failure', (message) => {
 
 client.on('disconnected', (reason) => {
     console.warn('[DISCONNECTED]', reason);
+    console.warn(
+        '[INFO] Check the logs and WhatsApp linked-device status.'
+    );
 });
 
 client.on('loading_screen', (percent, message) => {
@@ -106,21 +121,68 @@ client.on('change_state', (state) => {
     console.log('[STATE]', state);
 });
 
+// We expect phone-number pairing, not QR pairing.
+client.on('qr', () => {
+    console.error(
+        '[PAIRING WARNING] A QR event was received. ' +
+        'Check the installed whatsapp-web.js version and pairing configuration.'
+    );
+});
+
+// ============================================
+// CHECK BROWSER INSTALLATION
+// ============================================
+
+try {
+    const puppeteer = require('puppeteer');
+    const browserPath = puppeteer.executablePath();
+
+    console.log('[BROWSER] Expected Chrome location:', browserPath);
+
+    if (!fs.existsSync(browserPath)) {
+        console.error(
+            '[BROWSER ERROR] Chrome is missing from the expected location.'
+        );
+        console.error(
+            '[BROWSER FIX] Check the Puppeteer browser installation in Render.'
+        );
+    } else {
+        console.log('[BROWSER] Chrome executable found.');
+    }
+} catch (error) {
+    console.error(
+        '[BROWSER CHECK ERROR]',
+        error.message
+    );
+}
+
 // ============================================
 // START APPLICATION
 // ============================================
 
 async function startApplication() {
+    console.log('\n========================================');
     console.log('Starting Global Bullion Syndicate...');
     console.log('Authentication: Phone-number pairing');
-    console.log('QR display: Disabled');
+    console.log('QR display: Not used for pairing');
     console.log('Session identifier:', SESSION_ID);
+    console.log('========================================\n');
 
     try {
         await client.initialize();
     } catch (error) {
-        console.error('[STARTUP ERROR]', error.message);
+        console.error(
+            '[STARTUP ERROR]',
+            error.stack || error.message || error
+        );
+
         process.exitCode = 1;
+
+        try {
+            await client.destroy();
+        } catch {
+            // The client might not have finished initializing.
+        }
     }
 }
 
@@ -131,16 +193,22 @@ async function startApplication() {
 let shuttingDown = false;
 
 async function shutdown(signal) {
-    if (shuttingDown) return;
+    if (shuttingDown) {
+        return;
+    }
 
     shuttingDown = true;
+
     console.log(`\n[SHUTDOWN] Received ${signal}.`);
 
     try {
         await client.destroy();
         console.log('[SHUTDOWN] WhatsApp client closed.');
     } catch (error) {
-        console.error('[SHUTDOWN ERROR]', error.message);
+        console.error(
+            '[SHUTDOWN ERROR]',
+            error.message
+        );
     }
 
     process.exit(0);
