@@ -13,6 +13,7 @@
     "node": "20.x"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.24"
+    "@whiskeysockets/baileys": "6.7.24",
+    "pg": "8.16.3"
   }
 }
