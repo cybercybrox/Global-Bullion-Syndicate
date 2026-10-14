@@ -1,8 +1,8 @@
 {
   "name": "global-bullion-syndicate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Global Bullion Syndicate WhatsApp connection service",
+  "description": "Global Bullion Syndicate WhatsApp and Telegram message bridge",
   "license": "MIT",
   "main": "whatsapp.js",
   "type": "commonjs",
@@ -13,6 +13,8 @@
     "node": "20.x"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.24"
+    "@whiskeysockets/baileys": "6.7.24",
+    "dotenv": "^16.4.7",
+    "telegram": "^2.26.22"
   }
 }
