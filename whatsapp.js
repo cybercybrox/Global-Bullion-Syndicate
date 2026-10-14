@@ -1,84 +1,342 @@
 'use strict';
 
-const path = require('node:path');
-const fs = require('node:fs');
+const http = require('node:http');
+const { Pool } = require('pg');
 
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason
+    DisconnectReason,
+    initAuthCreds,
+    BufferJSON,
+    proto
 } = require('@whiskeysockets/baileys');
 
-// ============================================
-// GLOBAL BULLION SYNDICATE — CONFIGURATION
-// ============================================
-
-// Configure this in Render Environment Variables.
-// Use your international WhatsApp number with digits only.
 const PHONE_NUMBER = (
     process.env.WHATSAPP_PHONE_NUMBER || ''
 ).replace(/\D/g, '');
 
-// Configure this only when you have selected a
-// suitable persistent storage location on Render.
-const AUTH_DIR = path.resolve(
-    process.env.BAILEYS_AUTH_DIR || './baileys_auth'
-);
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+const SESSION_ID =
+    process.env.WHATSAPP_SESSION_ID ||
+    'global-bullion-syndicate-main';
+
+const PORT = Number(process.env.PORT || 10000);
 
 const INITIAL_RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 
-// ============================================
-// VALIDATE CONFIGURATION
-// ============================================
-
-if (!PHONE_NUMBER) {
-    throw new Error(
-        'Missing WHATSAPP_PHONE_NUMBER. ' +
-        'Add your international WhatsApp number ' +
-        'in Render Environment Variables.'
-    );
-}
+const TABLE_NAME = 'gbs_baileys_auth';
 
 if (!/^\d{8,15}$/.test(PHONE_NUMBER)) {
     throw new Error(
-        'Invalid WhatsApp number. Use the full ' +
-        'international number with its country code.'
+        'WHATSAPP_PHONE_NUMBER is missing or invalid. ' +
+        'Use the full international number with digits only.'
     );
 }
 
-// ============================================
-// PREPARE AUTHENTICATION DIRECTORY
-// ============================================
-
-try {
-    fs.mkdirSync(AUTH_DIR, {
-        recursive: true
-    });
-
-    fs.accessSync(
-        AUTH_DIR,
-        fs.constants.R_OK | fs.constants.W_OK
-    );
-} catch (error) {
+if (!DATABASE_URL) {
     throw new Error(
-        `Cannot access authentication directory: ${error.message}`
+        'DATABASE_URL is missing. Add a PostgreSQL connection ' +
+        'string in Render Environment Variables to preserve ' +
+        'WhatsApp authentication.'
     );
 }
 
-// ============================================
-// APPLICATION STATE
-// ============================================
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+    throw new Error('PORT is invalid.');
+}
+
+const pool = new Pool({
+    connectionString: DATABASE_URL,
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 20000,
+    keepAlive: true
+});
+
+pool.on('error', (error) => {
+    console.error(
+        '[DATABASE POOL ERROR]',
+        error.message || error
+    );
+});
 
 let activeSocket = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let connecting = false;
 let shuttingDown = false;
+let databaseReady = false;
+let whatsappStatus = 'starting';
+let lastConnectedAt = null;
+let server = null;
 
-// ============================================
-// CONNECTION UTILITIES
-// ============================================
+function sendJson(res, statusCode, data) {
+    const body = JSON.stringify(data);
+
+    res.writeHead(statusCode, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff'
+    });
+
+    res.end(body);
+}
+
+function startHttpServer() {
+    return new Promise((resolve, reject) => {
+        server = http.createServer((req, res) => {
+            if (req.method !== 'GET') {
+                res.setHeader('Allow', 'GET');
+
+                return sendJson(res, 405, {
+                    error: 'Method not allowed'
+                });
+            }
+
+            let pathname;
+
+            try {
+                pathname = new URL(
+                    req.url || '/',
+                    'http://localhost'
+                ).pathname;
+            } catch {
+                return sendJson(res, 400, {
+                    error: 'Invalid request URL'
+                });
+            }
+
+            if (
+                pathname === '/' ||
+                pathname === '/health' ||
+                pathname === '/status'
+            ) {
+                return sendJson(res, 200, {
+                    service: 'Global Bullion Syndicate',
+                    status: shuttingDown
+                        ? 'shutting_down'
+                        : 'running',
+                    database: databaseReady
+                        ? 'connected'
+                        : 'not_ready',
+                    whatsapp: whatsappStatus,
+                    last_connected_at: lastConnectedAt,
+                    uptime_seconds: Math.floor(
+                        process.uptime()
+                    )
+                });
+            }
+
+            return sendJson(res, 404, {
+                error: 'Not found'
+            });
+        });
+
+        server.once('error', reject);
+
+        server.listen(PORT, '0.0.0.0', () => {
+            server.removeListener('error', reject);
+
+            console.log(
+                `[HTTP] Listening on 0.0.0.0:${PORT}`
+            );
+
+            resolve();
+        });
+    });
+}
+
+function serialize(value) {
+    return JSON.stringify(value, BufferJSON.replacer);
+}
+
+function deserialize(value) {
+    if (
+        value === null ||
+        typeof value === 'undefined'
+    ) {
+        return null;
+    }
+
+    const json = typeof value === 'string'
+        ? value
+        : JSON.stringify(value);
+
+    return JSON.parse(json, BufferJSON.reviver);
+}
+
+async function saveAuthItem(type, id, value) {
+    if (
+        value === null ||
+        typeof value === 'undefined'
+    ) {
+        await pool.query(
+            `DELETE FROM ${TABLE_NAME}
+             WHERE session_id = $1
+             AND item_type = $2
+             AND item_id = $3`,
+            [SESSION_ID, type, id]
+        );
+
+        return;
+    }
+
+    await pool.query(
+        `INSERT INTO ${TABLE_NAME}
+            (
+                session_id,
+                item_type,
+                item_id,
+                item_value,
+                updated_at
+            )
+         VALUES ($1, $2, $3, $4::jsonb, NOW())
+         ON CONFLICT (session_id, item_type, item_id)
+         DO UPDATE SET
+            item_value = EXCLUDED.item_value,
+            updated_at = NOW()`,
+        [
+            SESSION_ID,
+            type,
+            id,
+            serialize(value)
+        ]
+    );
+}
+
+async function loadAuthItem(type, id) {
+    const result = await pool.query(
+        `SELECT item_value
+         FROM ${TABLE_NAME}
+         WHERE session_id = $1
+         AND item_type = $2
+         AND item_id = $3
+         LIMIT 1`,
+        [SESSION_ID, type, id]
+    );
+
+    if (!result.rowCount) {
+        return null;
+    }
+
+    return deserialize(result.rows[0].item_value);
+}
+
+async function createDatabaseAuthState() {
+    const savedCreds = await loadAuthItem(
+        'creds',
+        'creds'
+    );
+
+    const creds = savedCreds || initAuthCreds();
+
+    if (!savedCreds) {
+        await saveAuthItem(
+            'creds',
+            'creds',
+            creds
+        );
+
+        console.log(
+            '[AUTH] New authentication state created in PostgreSQL.'
+        );
+    } else {
+        console.log(
+            '[AUTH] Existing authentication state restored from PostgreSQL.'
+        );
+    }
+
+    return {
+        state: {
+            creds,
+
+            keys: {
+                get: async (type, ids) => {
+                    if (!ids.length) {
+                        return {};
+                    }
+
+                    const result = await pool.query(
+                        `SELECT item_id, item_value
+                         FROM ${TABLE_NAME}
+                         WHERE session_id = $1
+                         AND item_type = $2
+                         AND item_id = ANY($3::text[])`,
+                        [
+                            SESSION_ID,
+                            type,
+                            ids
+                        ]
+                    );
+
+                    const data = {};
+
+                    for (const row of result.rows) {
+                        let value = deserialize(
+                            row.item_value
+                        );
+
+                        if (
+                            type === 'app-state-sync-key' &&
+                            value
+                        ) {
+                            value =
+                                proto.Message.AppStateSyncKeyData
+                                    .fromObject(value);
+                        }
+
+                        data[row.item_id] = value;
+                    }
+
+                    return data;
+                },
+
+                set: async (data) => {
+                    const tasks = [];
+
+                    for (
+                        const [type, entries]
+                        of Object.entries(data)
+                    ) {
+                        for (
+                            const [id, value]
+                            of Object.entries(entries || {})
+                        ) {
+                            tasks.push(
+                                saveAuthItem(
+                                    type,
+                                    id,
+                                    value
+                                )
+                            );
+                        }
+                    }
+
+                    await Promise.all(tasks);
+                },
+
+                clear: async () => {
+                    await pool.query(
+                        `DELETE FROM ${TABLE_NAME}
+                         WHERE session_id = $1`,
+                        [SESSION_ID]
+                    );
+                }
+            }
+        },
+
+        saveCreds: async () => {
+            await saveAuthItem(
+                'creds',
+                'creds',
+                creds
+            );
+        }
+    };
+}
 
 function getDisconnectStatusCode(error) {
     return (
@@ -95,8 +353,6 @@ function scheduleReconnect(reason) {
 
     reconnectAttempts += 1;
 
-    // Gradually increase the delay after repeated failures.
-    // The delay never exceeds 30 seconds.
     const exponent = Math.min(
         reconnectAttempts - 1,
         4
@@ -107,21 +363,23 @@ function scheduleReconnect(reason) {
         MAX_RECONNECT_DELAY_MS
     );
 
+    whatsappStatus = 'reconnecting';
+
     console.warn(
-        `[RECONNECT] ${reason || 'Connection closed'}. ` +
-        `Retrying in ${Math.round(delay / 1000)} seconds. ` +
-        `Attempt ${reconnectAttempts}.`
+        `[RECONNECT] ${
+            reason || 'Connection closed'
+        }. Retry in ${
+            Math.ceil(delay / 1000)
+        }s (attempt ${reconnectAttempts}).`
     );
 
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         void connectToWhatsApp();
     }, delay);
-}
 
-// ============================================
-// START WHATSAPP CONNECTION
-// ============================================
+    reconnectTimer.unref?.();
+}
 
 async function connectToWhatsApp() {
     if (
@@ -133,43 +391,34 @@ async function connectToWhatsApp() {
     }
 
     connecting = true;
+    whatsappStatus = 'connecting';
+
+    let socketCreated = null;
 
     try {
-        const {
-            state,
-            saveCreds
-        } = await useMultiFileAuthState(AUTH_DIR);
+        const auth = await createDatabaseAuthState();
 
         let pairingCodeRequested = false;
 
         const sock = makeWASocket({
-            auth: state,
-
-            // We want a pairing code, not a displayed QR.
-            printQRInTerminal: false,
-
-            // Do not unnecessarily mark the account online.
-            markOnlineOnConnect: false
+            auth: auth.state,
+            markOnlineOnConnect: false,
+            syncFullHistory: false,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000
         });
 
+        socketCreated = sock;
         activeSocket = sock;
 
-        // ========================================
-        // SAVE AUTHENTICATION CHANGES
-        // ========================================
-
         sock.ev.on('creds.update', () => {
-            saveCreds().catch((error) => {
+            auth.saveCreds().catch((error) => {
                 console.error(
                     '[AUTH SAVE ERROR]',
-                    error.message
+                    error.message || error
                 );
             });
         });
-
-        // ========================================
-        // CONNECTION EVENTS AND PAIRING CODE
-        // ========================================
 
         sock.ev.on(
             'connection.update',
@@ -180,63 +429,36 @@ async function connectToWhatsApp() {
                     qr
                 } = update;
 
-                // Baileys emits a QR field as part of its
-                // connection lifecycle. We use that event
-                // to request a pairing code instead of
-                // displaying the QR itself.
-
                 if (
                     qr &&
-                    !state.creds.registered &&
+                    !auth.state.creds.registered &&
                     !pairingCodeRequested
                 ) {
                     pairingCodeRequested = true;
 
                     try {
-                        console.log('');
-                        console.log(
-                            '========================================'
-                        );
-                        console.log(
-                            ' GLOBAL BULLION SYNDICATE'
-                        );
-                        console.log(
-                            ' WHATSAPP PHONE-NUMBER PAIRING'
-                        );
-                        console.log(
-                            '========================================'
-                        );
-
                         const code =
                             await sock.requestPairingCode(
                                 PHONE_NUMBER
                             );
 
                         console.log(
+                            '========================================'
+                        );
+
+                        console.log(
+                            'GLOBAL BULLION SYNDICATE — PAIRING CODE'
+                        );
+
+                        console.log(
                             `Pairing code: ${code}`
                         );
 
-                        console.log('');
                         console.log(
-                            'On your phone:'
-                        );
-                        console.log(
-                            '1. Open WhatsApp.'
-                        );
-                        console.log(
-                            '2. Open Linked Devices.'
-                        );
-                        console.log(
-                            '3. Tap Link a Device.'
-                        );
-                        console.log(
-                            '4. Choose Link with phone number instead.'
-                        );
-                        console.log(
-                            '5. Enter the pairing code above.'
+                            'Enter it in WhatsApp > Linked Devices > ' +
+                            'Link a Device > Link with phone number instead.'
                         );
 
-                        console.log('');
                         console.log(
                             'Keep this code private.'
                         );
@@ -244,72 +466,36 @@ async function connectToWhatsApp() {
                         console.log(
                             '========================================'
                         );
-                        console.log('');
-
                     } catch (error) {
-                        pairingCodeRequested = false;
-
                         console.error(
                             '[PAIRING CODE ERROR]',
-                            error.stack ||
-                            error.message ||
-                            error
+                            error.message || error
                         );
                     }
                 }
 
-                // ====================================
-                // CONNECTING
-                // ====================================
-
                 if (connection === 'connecting') {
+                    whatsappStatus = 'connecting';
+
                     console.log(
-                        '[STATE] Connecting to WhatsApp...'
+                        '[WHATSAPP] Connecting.'
                     );
                 }
-
-                // ====================================
-                // CONNECTED
-                // ====================================
 
                 if (connection === 'open') {
                     reconnectAttempts = 0;
+                    whatsappStatus = 'connected';
 
-                    console.log('');
+                    lastConnectedAt =
+                        new Date().toISOString();
+
                     console.log(
-                        '========================================'
+                        '[WHATSAPP] Connected. ' +
+                        'Authentication state is stored in PostgreSQL.'
                     );
-                    console.log(
-                        ' GLOBAL BULLION SYNDICATE'
-                    );
-                    console.log(
-                        ' WHATSAPP CONNECTED'
-                    );
-                    console.log(
-                        '========================================'
-                    );
-                    console.log(
-                        'Connection: Ready'
-                    );
-                    console.log(
-                        'Authentication directory:',
-                        AUTH_DIR
-                    );
-                    console.log(
-                        'Private-chat test command: !ping'
-                    );
-                    console.log(
-                        '========================================'
-                    );
-                    console.log('');
                 }
 
-                // ====================================
-                // DISCONNECTED
-                // ====================================
-
                 if (connection === 'close') {
-                    // Ignore late events from an older socket.
                     if (sock !== activeSocket) {
                         return;
                     }
@@ -322,40 +508,31 @@ async function connectToWhatsApp() {
                         getDisconnectStatusCode(error);
 
                     console.warn(
-                        '[DISCONNECTED]',
-                        error?.message ||
-                        'Connection closed'
+                        '[WHATSAPP] Disconnected:',
+                        error?.message || 'Connection closed'
                     );
 
                     if (statusCode !== null) {
                         console.warn(
-                            '[DISCONNECT STATUS]',
+                            '[WHATSAPP] Disconnect status:',
                             statusCode
                         );
                     }
 
-                    // Do not endlessly retry a logged-out session.
                     if (
                         statusCode ===
                         DisconnectReason.loggedOut
                     ) {
-                        console.error(
-                            '[AUTH] WhatsApp logged out this linked device.'
-                        );
+                        whatsappStatus = 'logged_out';
 
                         console.error(
-                            '[AUTH] Check your account and saved session.'
-                        );
-
-                        console.error(
-                            '[AUTH] Only clear saved authentication data ' +
-                            'if you deliberately intend to pair again.'
+                            '[AUTH] WhatsApp logged out this linked device. ' +
+                            'Review the session before deliberately pairing again.'
                         );
 
                         return;
                     }
 
-                    // Try to restore the connection for other failures.
                     scheduleReconnect(
                         error?.message ||
                         'WhatsApp connection closed'
@@ -363,16 +540,6 @@ async function connectToWhatsApp() {
                 }
             }
         );
-
-        // ========================================
-        // PRIVATE-CHAT TEST COMMAND
-        // ========================================
-
-        // This command lets you verify that the bot can
-        // receive a message and send a reply.
-        //
-        // It responds only to !ping or /ping in private
-        // chats. It does not reply to group messages.
 
         sock.ev.on(
             'messages.upsert',
@@ -426,37 +593,41 @@ async function connectToWhatsApp() {
                         console.log(
                             '[MESSAGE] Replied to a private ping test.'
                         );
-
                     } catch (error) {
                         console.error(
                             '[MESSAGE ERROR]',
-                            error.message
+                            error.message || error
                         );
                     }
                 }
             }
         );
-
     } catch (error) {
+        if (
+            socketCreated &&
+            socketCreated === activeSocket
+        ) {
+            activeSocket = null;
+
+            try {
+                socketCreated.end(error);
+            } catch {}
+        }
+
+        whatsappStatus = 'error';
+
         console.error(
-            '[STARTUP ERROR]',
-            error.stack ||
-            error.message ||
-            error
+            '[WHATSAPP START ERROR]',
+            error.stack || error.message || error
         );
 
         scheduleReconnect(
-            error?.message || 'Startup failed'
+            error?.message || 'WhatsApp startup failed'
         );
-
     } finally {
         connecting = false;
     }
 }
-
-// ============================================
-// GRACEFUL SHUTDOWN
-// ============================================
 
 async function shutdown(signal) {
     if (shuttingDown) {
@@ -464,10 +635,9 @@ async function shutdown(signal) {
     }
 
     shuttingDown = true;
+    whatsappStatus = 'shutting_down';
 
-    console.log(
-        `\n[SHUTDOWN] Received ${signal}.`
-    );
+    console.log(`[SHUTDOWN] ${signal}`);
 
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
@@ -479,21 +649,32 @@ async function shutdown(signal) {
             activeSocket.end(
                 new Error(`Process shutdown: ${signal}`)
             );
-
-            activeSocket = null;
-
         } catch (error) {
             console.error(
-                '[SHUTDOWN ERROR]',
-                error.message
+                '[SHUTDOWN SOCKET ERROR]',
+                error.message || error
             );
         }
+
+        activeSocket = null;
     }
 
-    // Allow a brief moment for shutdown operations.
-    setTimeout(() => {
-        process.exit(0);
-    }, 500).unref();
+    if (server?.listening) {
+        await new Promise((resolve) => {
+            server.close(resolve);
+        });
+    }
+
+    try {
+        await pool.end();
+    } catch (error) {
+        console.error(
+            '[DATABASE SHUTDOWN ERROR]',
+            error.message || error
+        );
+    }
+
+    process.exit(0);
 }
 
 process.once('SIGINT', () => {
@@ -504,29 +685,56 @@ process.once('SIGTERM', () => {
     void shutdown('SIGTERM');
 });
 
-// ============================================
-// RUN APPLICATION
-// ============================================
+async function main() {
+    await pool.query('SELECT 1');
 
-console.log(
-    'Starting Global Bullion Syndicate...'
-);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
+            session_id TEXT NOT NULL,
+            item_type TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            item_value JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (
+                session_id,
+                item_type,
+                item_id
+            )
+        )
+    `);
 
-console.log(
-    'WhatsApp library: Baileys'
-);
+    databaseReady = true;
 
-console.log(
-    'Browser requirement: No Chrome installation'
-);
+    console.log(
+        '[DATABASE] PostgreSQL is ready.'
+    );
 
-console.log(
-    'Authentication: Phone-number pairing'
-);
+    await startHttpServer();
 
-console.log(
-    'Authentication directory:',
-    AUTH_DIR
-);
+    console.log(
+        '[APP] Global Bullion Syndicate is ready.'
+    );
 
-void connectToWhatsApp();
+    console.log(
+        '[APP] Health endpoint: /health'
+    );
+
+    console.log(
+        '[APP] Status endpoint: /status'
+    );
+
+    void connectToWhatsApp();
+}
+
+main().catch(async (error) => {
+    console.error(
+        '[FATAL STARTUP ERROR]',
+        error.stack || error.message || error
+    );
+
+    try {
+        await pool.end();
+    } catch {}
+
+    process.exit(1);
+});
