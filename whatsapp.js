@@ -1,26 +1,32 @@
 'use strict';
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const path = require('path');
-const fs = require('fs');
+const path = require('node:path');
+const fs = require('node:fs');
+
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason
+} = require('@whiskeysockets/baileys');
 
 // ============================================
 // GLOBAL BULLION SYNDICATE — CONFIGURATION
 // ============================================
 
-// Set this in Render's Environment Variables.
-// Use the international number with digits only.
+// Configure this in Render Environment Variables.
+// Use your international WhatsApp number with digits only.
 const PHONE_NUMBER = (
     process.env.WHATSAPP_PHONE_NUMBER || ''
 ).replace(/\D/g, '');
 
-const SESSION_ID = 'global-bullion-syndicate';
-
-const SESSION_PATH = path.resolve(
-    process.env.WWEBJS_AUTH_PATH || '.wwebjs_auth'
+// Configure this only when you have selected a
+// suitable persistent storage location on Render.
+const AUTH_DIR = path.resolve(
+    process.env.BAILEYS_AUTH_DIR || './baileys_auth'
 );
 
-const PAIRING_INTERVAL_MS = 180000;
+const INITIAL_RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECT_DELAY_MS = 30000;
 
 // ============================================
 // VALIDATE CONFIGURATION
@@ -29,168 +35,428 @@ const PAIRING_INTERVAL_MS = 180000;
 if (!PHONE_NUMBER) {
     throw new Error(
         'Missing WHATSAPP_PHONE_NUMBER. ' +
-        'Add your international phone number in Render Environment Variables.'
+        'Add your international WhatsApp number ' +
+        'in Render Environment Variables.'
     );
 }
 
 if (!/^\d{8,15}$/.test(PHONE_NUMBER)) {
     throw new Error(
-        'Invalid WhatsApp number. Use international format with digits only.'
+        'Invalid WhatsApp number. Use the full ' +
+        'international number with its country code.'
     );
 }
 
 // ============================================
-// CREATE WHATSAPP CLIENT
-// ============================================
-
-const client = new Client({
-    authStrategy: new LocalAuth({
-        clientId: SESSION_ID,
-        dataPath: SESSION_PATH
-    }),
-
-    pairWithPhoneNumber: {
-        phoneNumber: PHONE_NUMBER,
-        showNotification: true,
-        intervalMs: PAIRING_INTERVAL_MS
-    },
-
-    puppeteer: {
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox'
-        ]
-    }
-});
-
-// ============================================
-// PHONE-NUMBER PAIRING
-// ============================================
-
-client.on('code', (code) => {
-    console.log('\n========================================');
-    console.log(' GLOBAL BULLION SYNDICATE');
-    console.log(' WHATSAPP PAIRING CODE');
-    console.log('========================================');
-    console.log(`Pairing code: ${code}`);
-    console.log('\nOn your phone:');
-    console.log('1. Open WhatsApp.');
-    console.log('2. Open Linked Devices.');
-    console.log('3. Tap Link a Device.');
-    console.log('4. Choose Link with phone number instead.');
-    console.log('5. Enter the pairing code shown above.');
-    console.log('========================================\n');
-});
-
-// ============================================
-// CONNECTION EVENTS
-// ============================================
-
-client.on('authenticated', () => {
-    console.log('[AUTH] WhatsApp authentication successful.');
-});
-
-client.on('ready', () => {
-    console.log('\n========================================');
-    console.log(' GLOBAL BULLION SYNDICATE');
-    console.log(' WHATSAPP CONNECTED');
-    console.log('========================================');
-    console.log('Session ID:', SESSION_ID);
-    console.log('Session directory:', SESSION_PATH);
-    console.log('WhatsApp client is ready.');
-    console.log('========================================\n');
-});
-
-client.on('auth_failure', (message) => {
-    console.error('[AUTH ERROR]', message);
-});
-
-client.on('disconnected', (reason) => {
-    console.warn('[DISCONNECTED]', reason);
-    console.warn(
-        '[INFO] Check the logs and WhatsApp linked-device status.'
-    );
-});
-
-client.on('loading_screen', (percent, message) => {
-    console.log(`[LOADING] ${percent}% - ${message}`);
-});
-
-client.on('change_state', (state) => {
-    console.log('[STATE]', state);
-});
-
-// We expect phone-number pairing, not QR pairing.
-client.on('qr', () => {
-    console.error(
-        '[PAIRING WARNING] A QR event was received. ' +
-        'Check the installed whatsapp-web.js version and pairing configuration.'
-    );
-});
-
-// ============================================
-// CHECK BROWSER INSTALLATION
+// PREPARE AUTHENTICATION DIRECTORY
 // ============================================
 
 try {
-    const puppeteer = require('puppeteer');
-    const browserPath = puppeteer.executablePath();
+    fs.mkdirSync(AUTH_DIR, {
+        recursive: true
+    });
 
-    console.log('[BROWSER] Expected Chrome location:', browserPath);
-
-    if (!fs.existsSync(browserPath)) {
-        console.error(
-            '[BROWSER ERROR] Chrome is missing from the expected location.'
-        );
-        console.error(
-            '[BROWSER FIX] Check the Puppeteer browser installation in Render.'
-        );
-    } else {
-        console.log('[BROWSER] Chrome executable found.');
-    }
+    fs.accessSync(
+        AUTH_DIR,
+        fs.constants.R_OK | fs.constants.W_OK
+    );
 } catch (error) {
-    console.error(
-        '[BROWSER CHECK ERROR]',
-        error.message
+    throw new Error(
+        `Cannot access authentication directory: ${error.message}`
     );
 }
 
 // ============================================
-// START APPLICATION
+// APPLICATION STATE
 // ============================================
 
-async function startApplication() {
-    console.log('\n========================================');
-    console.log('Starting Global Bullion Syndicate...');
-    console.log('Authentication: Phone-number pairing');
-    console.log('QR display: Not used for pairing');
-    console.log('Session identifier:', SESSION_ID);
-    console.log('========================================\n');
+let activeSocket = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let connecting = false;
+let shuttingDown = false;
+
+// ============================================
+// CONNECTION UTILITIES
+// ============================================
+
+function getDisconnectStatusCode(error) {
+    return (
+        error?.output?.statusCode ??
+        error?.statusCode ??
+        null
+    );
+}
+
+function scheduleReconnect(reason) {
+    if (shuttingDown || reconnectTimer) {
+        return;
+    }
+
+    reconnectAttempts += 1;
+
+    // Gradually increase the delay after repeated failures.
+    // The delay never exceeds 30 seconds.
+    const exponent = Math.min(
+        reconnectAttempts - 1,
+        4
+    );
+
+    const delay = Math.min(
+        INITIAL_RECONNECT_DELAY_MS * (2 ** exponent),
+        MAX_RECONNECT_DELAY_MS
+    );
+
+    console.warn(
+        `[RECONNECT] ${reason || 'Connection closed'}. ` +
+        `Retrying in ${Math.round(delay / 1000)} seconds. ` +
+        `Attempt ${reconnectAttempts}.`
+    );
+
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void connectToWhatsApp();
+    }, delay);
+}
+
+// ============================================
+// START WHATSAPP CONNECTION
+// ============================================
+
+async function connectToWhatsApp() {
+    if (
+        shuttingDown ||
+        connecting ||
+        activeSocket
+    ) {
+        return;
+    }
+
+    connecting = true;
 
     try {
-        await client.initialize();
+        const {
+            state,
+            saveCreds
+        } = await useMultiFileAuthState(AUTH_DIR);
+
+        let pairingCodeRequested = false;
+
+        const sock = makeWASocket({
+            auth: state,
+
+            // We want a pairing code, not a displayed QR.
+            printQRInTerminal: false,
+
+            // Do not unnecessarily mark the account online.
+            markOnlineOnConnect: false
+        });
+
+        activeSocket = sock;
+
+        // ========================================
+        // SAVE AUTHENTICATION CHANGES
+        // ========================================
+
+        sock.ev.on('creds.update', () => {
+            saveCreds().catch((error) => {
+                console.error(
+                    '[AUTH SAVE ERROR]',
+                    error.message
+                );
+            });
+        });
+
+        // ========================================
+        // CONNECTION EVENTS AND PAIRING CODE
+        // ========================================
+
+        sock.ev.on(
+            'connection.update',
+            async (update) => {
+                const {
+                    connection,
+                    lastDisconnect,
+                    qr
+                } = update;
+
+                // Baileys emits a QR field as part of its
+                // connection lifecycle. We use that event
+                // to request a pairing code instead of
+                // displaying the QR itself.
+
+                if (
+                    qr &&
+                    !state.creds.registered &&
+                    !pairingCodeRequested
+                ) {
+                    pairingCodeRequested = true;
+
+                    try {
+                        console.log('');
+                        console.log(
+                            '========================================'
+                        );
+                        console.log(
+                            ' GLOBAL BULLION SYNDICATE'
+                        );
+                        console.log(
+                            ' WHATSAPP PHONE-NUMBER PAIRING'
+                        );
+                        console.log(
+                            '========================================'
+                        );
+
+                        const code =
+                            await sock.requestPairingCode(
+                                PHONE_NUMBER
+                            );
+
+                        console.log(
+                            `Pairing code: ${code}`
+                        );
+
+                        console.log('');
+                        console.log(
+                            'On your phone:'
+                        );
+                        console.log(
+                            '1. Open WhatsApp.'
+                        );
+                        console.log(
+                            '2. Open Linked Devices.'
+                        );
+                        console.log(
+                            '3. Tap Link a Device.'
+                        );
+                        console.log(
+                            '4. Choose Link with phone number instead.'
+                        );
+                        console.log(
+                            '5. Enter the pairing code above.'
+                        );
+
+                        console.log('');
+                        console.log(
+                            'Keep this code private.'
+                        );
+
+                        console.log(
+                            '========================================'
+                        );
+                        console.log('');
+
+                    } catch (error) {
+                        pairingCodeRequested = false;
+
+                        console.error(
+                            '[PAIRING CODE ERROR]',
+                            error.stack ||
+                            error.message ||
+                            error
+                        );
+                    }
+                }
+
+                // ====================================
+                // CONNECTING
+                // ====================================
+
+                if (connection === 'connecting') {
+                    console.log(
+                        '[STATE] Connecting to WhatsApp...'
+                    );
+                }
+
+                // ====================================
+                // CONNECTED
+                // ====================================
+
+                if (connection === 'open') {
+                    reconnectAttempts = 0;
+
+                    console.log('');
+                    console.log(
+                        '========================================'
+                    );
+                    console.log(
+                        ' GLOBAL BULLION SYNDICATE'
+                    );
+                    console.log(
+                        ' WHATSAPP CONNECTED'
+                    );
+                    console.log(
+                        '========================================'
+                    );
+                    console.log(
+                        'Connection: Ready'
+                    );
+                    console.log(
+                        'Authentication directory:',
+                        AUTH_DIR
+                    );
+                    console.log(
+                        'Private-chat test command: !ping'
+                    );
+                    console.log(
+                        '========================================'
+                    );
+                    console.log('');
+                }
+
+                // ====================================
+                // DISCONNECTED
+                // ====================================
+
+                if (connection === 'close') {
+                    // Ignore late events from an older socket.
+                    if (sock !== activeSocket) {
+                        return;
+                    }
+
+                    activeSocket = null;
+
+                    const error = lastDisconnect?.error;
+
+                    const statusCode =
+                        getDisconnectStatusCode(error);
+
+                    console.warn(
+                        '[DISCONNECTED]',
+                        error?.message ||
+                        'Connection closed'
+                    );
+
+                    if (statusCode !== null) {
+                        console.warn(
+                            '[DISCONNECT STATUS]',
+                            statusCode
+                        );
+                    }
+
+                    // Do not endlessly retry a logged-out session.
+                    if (
+                        statusCode ===
+                        DisconnectReason.loggedOut
+                    ) {
+                        console.error(
+                            '[AUTH] WhatsApp logged out this linked device.'
+                        );
+
+                        console.error(
+                            '[AUTH] Check your account and saved session.'
+                        );
+
+                        console.error(
+                            '[AUTH] Only clear saved authentication data ' +
+                            'if you deliberately intend to pair again.'
+                        );
+
+                        return;
+                    }
+
+                    // Try to restore the connection for other failures.
+                    scheduleReconnect(
+                        error?.message ||
+                        'WhatsApp connection closed'
+                    );
+                }
+            }
+        );
+
+        // ========================================
+        // PRIVATE-CHAT TEST COMMAND
+        // ========================================
+
+        // This command lets you verify that the bot can
+        // receive a message and send a reply.
+        //
+        // It responds only to !ping or /ping in private
+        // chats. It does not reply to group messages.
+
+        sock.ev.on(
+            'messages.upsert',
+            async ({ messages, type }) => {
+                if (type !== 'notify') {
+                    return;
+                }
+
+                for (const message of messages || []) {
+                    if (
+                        !message?.message ||
+                        message.key?.fromMe
+                    ) {
+                        continue;
+                    }
+
+                    const remoteJid =
+                        message.key?.remoteJid;
+
+                    if (
+                        !remoteJid ||
+                        remoteJid === 'status@broadcast' ||
+                        remoteJid.endsWith('@g.us')
+                    ) {
+                        continue;
+                    }
+
+                    const text = (
+                        message.message.conversation ||
+                        message.message
+                            .extendedTextMessage?.text ||
+                        ''
+                    ).trim().toLowerCase();
+
+                    if (
+                        text !== '!ping' &&
+                        text !== '/ping'
+                    ) {
+                        continue;
+                    }
+
+                    try {
+                        await sock.sendMessage(
+                            remoteJid,
+                            {
+                                text:
+                                    '🐂 Global Bullion Syndicate is online.'
+                            }
+                        );
+
+                        console.log(
+                            '[MESSAGE] Replied to a private ping test.'
+                        );
+
+                    } catch (error) {
+                        console.error(
+                            '[MESSAGE ERROR]',
+                            error.message
+                        );
+                    }
+                }
+            }
+        );
+
     } catch (error) {
         console.error(
             '[STARTUP ERROR]',
-            error.stack || error.message || error
+            error.stack ||
+            error.message ||
+            error
         );
 
-        process.exitCode = 1;
+        scheduleReconnect(
+            error?.message || 'Startup failed'
+        );
 
-        try {
-            await client.destroy();
-        } catch {
-            // The client might not have finished initializing.
-        }
+    } finally {
+        connecting = false;
     }
 }
 
 // ============================================
-// SAFE SHUTDOWN
+// GRACEFUL SHUTDOWN
 // ============================================
-
-let shuttingDown = false;
 
 async function shutdown(signal) {
     if (shuttingDown) {
@@ -199,26 +465,68 @@ async function shutdown(signal) {
 
     shuttingDown = true;
 
-    console.log(`\n[SHUTDOWN] Received ${signal}.`);
+    console.log(
+        `\n[SHUTDOWN] Received ${signal}.`
+    );
 
-    try {
-        await client.destroy();
-        console.log('[SHUTDOWN] WhatsApp client closed.');
-    } catch (error) {
-        console.error(
-            '[SHUTDOWN ERROR]',
-            error.message
-        );
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
     }
 
-    process.exit(0);
+    if (activeSocket) {
+        try {
+            activeSocket.end(
+                new Error(`Process shutdown: ${signal}`)
+            );
+
+            activeSocket = null;
+
+        } catch (error) {
+            console.error(
+                '[SHUTDOWN ERROR]',
+                error.message
+            );
+        }
+    }
+
+    // Allow a brief moment for shutdown operations.
+    setTimeout(() => {
+        process.exit(0);
+    }, 500).unref();
 }
 
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => {
+    void shutdown('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+    void shutdown('SIGTERM');
+});
 
 // ============================================
-// RUN
+// RUN APPLICATION
 // ============================================
 
-startApplication();
+console.log(
+    'Starting Global Bullion Syndicate...'
+);
+
+console.log(
+    'WhatsApp library: Baileys'
+);
+
+console.log(
+    'Browser requirement: No Chrome installation'
+);
+
+console.log(
+    'Authentication: Phone-number pairing'
+);
+
+console.log(
+    'Authentication directory:',
+    AUTH_DIR
+);
+
+void connectToWhatsApp();
