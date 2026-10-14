@@ -1,17 +1,18 @@
 {
-"name": "global-bullion-syndicate",
-"version": "1.0.0",
-"description": "Global Bullion Syndicate WhatsApp connection service",
-"license": "MIT",
-"main": "whatsapp.js",
-"scripts": {
-"start": "node whatsapp.js",
-"postinstall": "npx puppeteer browsers install chrome@146.0.7680.31"
-},
-"engines": {
-"node": "20.x"
-},
-"dependencies": {
-"whatsapp-web.js": "1.34.7"
-}
+  "name": "global-bullion-syndicate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Global Bullion Syndicate WhatsApp connection service",
+  "license": "MIT",
+  "main": "whatsapp.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node whatsapp.js"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.24"
+  }
 }
